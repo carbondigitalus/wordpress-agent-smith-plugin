@@ -1,8 +1,8 @@
 <?php
 /*
-Plugin Name: Agent Smith (GitHub Edition) – Permanent Fix
-Description: Completely rebuilds the WordPress core update transient using GitHub data so that it always includes php_version and mysql_version.
-Version: 1.7.0
+Plugin Name: Agent Smith (GitHub Edition) – Plugins & Themes Only
+Description: Overrides plugin and theme updates by rebuilding their transients using data from your GitHub repository.
+Version: 1.0.0
 Author: Carbon Digital
 Author URI: https://carbondigital.us
 */
@@ -11,73 +11,110 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-class AgentSmith {
+class AgentSmith_MU {
     private $github_base_url;
     private $github_token;
 
     public function __construct() {
-        // Load our settings.
+        // Load settings.
         $this->github_base_url = get_option( 'agent_smith_github_repo', '' );
         $this->github_token    = get_option( 'agent_smith_github_token', '' );
 
-        // Force our update transient to be rebuilt.
-        add_filter( 'pre_set_site_transient_update_core', array( $this, 'build_core_update_transient' ) );
+        // Override plugin updates.
+        add_filter( 'pre_set_site_transient_update_plugins', array( $this, 'build_plugin_update_transient' ) );
+        // Override theme updates.
+        add_filter( 'pre_set_site_transient_update_themes', array( $this, 'build_theme_update_transient' ) );
 
-        // Options page.
-        add_action( 'admin_menu', array( $this, 'add_options_page' ) );
+        // Force update the transients on admin load.
+        add_action( 'admin_init', array( $this, 'force_plugin_update_transient' ), 1 );
+        add_action( 'admin_init', array( $this, 'force_theme_update_transient' ), 1 );
+
+        // Options page: In multisite, add to network admin; otherwise, add to admin menu.
+        if ( is_multisite() ) {
+            add_action( 'network_admin_menu', array( $this, 'add_options_page' ) );
+        } else {
+            add_action( 'admin_menu', array( $this, 'add_options_page' ) );
+        }
         add_action( 'admin_init', array( $this, 'register_settings' ) );
     }
 
     /**
-     * Build and return a complete update_core transient that always includes all required keys.
+     * Build the plugin update transient using GitHub data.
      */
-    public function build_core_update_transient( $transient ) {
-        $current_version = get_bloginfo( 'version' );
-        $locale          = get_locale();
-
-        // Try to fetch update info from GitHub.
-        $github_data = $this->make_github_request( 'core.json' );
-
-        if ( $github_data && is_array( $github_data ) && ! empty( $github_data['current'] ) ) {
-            $update = new stdClass();
-            $update->response = 'upgrade';
-            $update->current  = $github_data['current'];
-            $update->locale   = isset( $github_data['locale'] ) ? $github_data['locale'] : $locale;
-            $update->package  = isset( $github_data['package'] ) ? $github_data['package'] : '';
-            // Build the required packages object.
-            $update->packages = new stdClass();
-            $update->packages->full = $update->package;
-            $update->packages->partial = '';       // Not provided.
-            $update->packages->new_bundled = '';     // Not provided.
-            $update->packages->no_content = '';      // Not provided.
-        } else {
-            $update = new stdClass();
-            $update->response = 'latest';
-            $update->current  = $current_version;
-            $update->locale   = $locale;
-            $update->package  = '';
-            $update->packages = new stdClass();
-            $update->packages->full = '';
-            $update->packages->partial = '';
-            $update->packages->new_bundled = '';
-            $update->packages->no_content = '';
+    public function build_plugin_update_transient( $transient ) {
+        // Initialize a new object if needed.
+        if ( ! is_object( $transient ) ) {
+            $transient = new stdClass();
         }
-
-        // Build the transient with all required properties.
-        $new_transient = new stdClass();
-        $new_transient->updates         = array( $update );
-        $new_transient->current         = $update->current;
-        $new_transient->locale          = $update->locale;
-        $new_transient->version_checked = $update->current;
-        $new_transient->php_version     = PHP_VERSION;
-        global $wpdb;
-        $new_transient->mysql_version   = ( isset( $wpdb ) && is_object( $wpdb ) ) ? $wpdb->db_version() : '';
-
-        return $new_transient;
+        // Attempt to fetch data from GitHub.
+        $github_data = $this->make_github_request( 'plugins.json' );
+        if ( $github_data && is_array( $github_data ) ) {
+            $response = array();
+            foreach ( $github_data as $plugin_slug => $data ) {
+                if ( ! empty( $data ) ) {
+                    // Convert the data to an object.
+                    $response[$plugin_slug] = (object) $data;
+                }
+            }
+            $transient->response = $response;
+        }
+        return $transient;
     }
 
     /**
-     * Create a dedicated settings page under Settings → Agent Smith.
+     * Build the theme update transient using GitHub data.
+     */
+    public function build_theme_update_transient( $transient ) {
+        if ( ! is_object( $transient ) ) {
+            $transient = new stdClass();
+        }
+        $github_data = $this->make_github_request( 'themes.json' );
+        if ( $github_data && is_array( $github_data ) ) {
+            $response = array();
+            foreach ( $github_data as $theme_slug => $data ) {
+                if ( ! empty( $data ) ) {
+                    $response[$theme_slug] = (object) $data;
+                }
+            }
+            $transient->response = $response;
+        }
+        return $transient;
+    }
+
+    /**
+     * Force-update the plugin update transient on admin load.
+     */
+    public function force_plugin_update_transient() {
+        if ( is_admin() && function_exists( 'update_site_transient' ) ) {
+            delete_site_transient( 'update_plugins' );
+            if ( function_exists( 'wp_cache_flush' ) ) {
+                wp_cache_flush();
+            }
+            $transient = $this->build_plugin_update_transient( new stdClass() );
+            if ( is_object( $transient ) ) {
+                update_site_transient( 'update_plugins', $transient );
+            }
+        }
+    }
+
+    /**
+     * Force-update the theme update transient on admin load.
+     */
+    public function force_theme_update_transient() {
+        if ( is_admin() && function_exists( 'update_site_transient' ) ) {
+            delete_site_transient( 'update_themes' );
+            if ( function_exists( 'wp_cache_flush' ) ) {
+                wp_cache_flush();
+            }
+            $transient = $this->build_theme_update_transient( new stdClass() );
+            if ( is_object( $transient ) ) {
+                update_site_transient( 'update_themes', $transient );
+            }
+        }
+    }
+
+    /**
+     * Add an options page.
      */
     public function add_options_page() {
         add_options_page(
@@ -90,7 +127,7 @@ class AgentSmith {
     }
 
     /**
-     * Register our settings.
+     * Register plugin settings.
      */
     public function register_settings() {
         register_setting( 'agent_smith_settings', 'agent_smith_github_repo', array(
@@ -101,16 +138,14 @@ class AgentSmith {
             'type'              => 'string',
             'sanitize_callback' => 'sanitize_text_field'
         ) );
-
         add_settings_section(
             'agent_smith_main_section',
             'Agent Smith Settings',
             function() {
-                echo '<p>Configure Agent Smith to override WordPress core updates with data from your GitHub repository.</p>';
+                echo '<p>Configure Agent Smith with your GitHub repository settings.</p>';
             },
             'agent-smith'
         );
-
         add_settings_field(
             'agent_smith_github_repo',
             'GitHub Repo URL',
@@ -128,7 +163,7 @@ class AgentSmith {
     }
 
     /**
-     * Render the settings page.
+     * Render the options page.
      */
     public function settings_page_content() {
         ?>
@@ -187,4 +222,4 @@ class AgentSmith {
     }
 }
 
-new AgentSmith();
+new AgentSmith_MU();
